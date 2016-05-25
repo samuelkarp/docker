@@ -573,7 +573,7 @@ func TestCollectBatchMaxEvents(t *testing.T) {
 }
 
 func TestCollectBatchMaxTotalBytes(t *testing.T) {
-	mockClient := newMockClientBuffered(1)
+	mockClient := newMockClientBuffered(0)
 	stream := &logStream{
 		client:        mockClient,
 		logGroupName:  groupName,
@@ -581,11 +581,13 @@ func TestCollectBatchMaxTotalBytes(t *testing.T) {
 		sequenceToken: aws.String(sequenceToken),
 		messages:      make(chan *logger.Message),
 	}
-	mockClient.putLogEventsResult <- &putLogEventsResult{
-		successResult: &cloudwatchlogs.PutLogEventsOutput{
-			NextSequenceToken: aws.String(nextSequenceToken),
-		},
-	}
+	go func() {
+		mockClient.putLogEventsResult <- &putLogEventsResult{
+			successResult: &cloudwatchlogs.PutLogEventsOutput{
+				NextSequenceToken: aws.String(nextSequenceToken),
+			},
+		}
+	}()
 	var ticks = make(chan time.Time)
 	newTicker = func(_ time.Duration) *time.Ticker {
 		return &time.Ticker{
@@ -601,27 +603,33 @@ func TestCollectBatchMaxTotalBytes(t *testing.T) {
 		Timestamp: time.Time{},
 	})
 
+	assertDone := make(chan struct{})
+	go func() {
+		argument := <-mockClient.putLogEventsArgument
+		if argument == nil {
+			t.Fatal("Expected non-nil PutLogEventsInput")
+		}
+		bytes := 0
+		for _, event := range argument.LogEvents {
+			bytes += len(*event.Message)
+		}
+		if bytes > maximumBytesPerPut {
+			t.Errorf("Expected <= %d bytes but was %d", maximumBytesPerPut, bytes)
+		}
+
+		argument = <-mockClient.putLogEventsArgument
+		if len(argument.LogEvents) != 1 {
+			t.Errorf("Expected LogEvents to contain 1 elements, but contains %d", len(argument.LogEvents))
+		}
+		message := *argument.LogEvents[0].Message
+		if message[len(message)-1:] != "B" {
+			t.Errorf("Expected message to be %s but was %s", "B", message[len(message)-1:])
+		}
+		assertDone <- struct{}{}
+	}()
+
 	// no ticks
 	stream.Close()
 
-	argument := <-mockClient.putLogEventsArgument
-	if argument == nil {
-		t.Fatal("Expected non-nil PutLogEventsInput")
-	}
-	bytes := 0
-	for _, event := range argument.LogEvents {
-		bytes += len(*event.Message)
-	}
-	if bytes > maximumBytesPerPut {
-		t.Errorf("Expected <= %d bytes but was %d", maximumBytesPerPut, bytes)
-	}
-
-	argument = <-mockClient.putLogEventsArgument
-	if len(argument.LogEvents) != 1 {
-		t.Errorf("Expected LogEvents to contain 1 elements, but contains %d", len(argument.LogEvents))
-	}
-	message := *argument.LogEvents[0].Message
-	if message[len(message)-1:] != "B" {
-		t.Errorf("Expected message to be %s but was %s", "B", message[len(message)-1:])
-	}
+	<-assertDone
 }
